@@ -82,7 +82,7 @@ class GaussianModel:
         self.defualt_wind_speed = torch.tensor(17.0 / 50.0).float().unsqueeze(0).unsqueeze(0).unsqueeze(0).cuda()
         self.Temp_TimeNet = Temp_TimeNet().cuda()
 
-        self.Temp_Time_DerivativeNet = Temp_Time_DerivativeNet().to(device='cuda:1')
+        self.Temp_Time_DerivativeNet = Temp_Time_DerivativeNet().to(device='cuda:0')
         self.ConvectiveHeatTransfer = torch.empty(0)
         self.Emissivity = torch.empty(0)
         self.HeatCapacity = torch.empty(0)
@@ -95,7 +95,7 @@ class GaussianModel:
         # self.env_temp = torch.tensor(((36 + 273.15) - self.min_temp) / (self.max_temp - self.min_temp)).float().unsqueeze(0).unsqueeze(0).unsqueeze(0).cuda()
         # self.wind_speed = torch.tensor(17.0 / 50.0).float().unsqueeze(0).unsqueeze(0).unsqueeze(0).cuda()
         # self.Temp_TimeNet = Temp_TimeNet().cuda()
-        # self.Temp_Time_DerivativeNet = Temp_Time_DerivativeNet().to(device='cuda:1')
+        # self.Temp_Time_DerivativeNet = Temp_Time_DerivativeNet().to(device='cuda:0')
         # self.ConvectiveHeatTransfer = torch.empty(0)
         # self.Emissivity = torch.empty(0)
         # self.HeatCapacity = torch.empty(0)
@@ -215,7 +215,12 @@ class GaussianModel:
         rots[:, 0] = 1
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-        self.space_feature = torch.nn.functional.normalize(space_features[:, -33:-1], p=2, dim=1).unsqueeze(0)
+        # 修改开始：增加对 None 的判断
+        if space_features is not None:
+            self.space_feature = torch.nn.functional.normalize(space_features[:, -33:-1], p=2, dim=1).unsqueeze(0)
+        else:
+            self.space_feature = torch.empty(0).cuda()
+        # 修改结束
         # self.space_feature = space_features.unsqueeze(0)
         if self.feature_time:
             self._xyz = fused_point_cloud
@@ -425,8 +430,11 @@ class GaussianModel:
         # self.HeatCapacityNet.load_state_dict(ckpt['HeatCapacityNet'])
 
         self.Temp_Time_DerivativeNet.load_state_dict(ckpt['Temp_Time_DerivativeNet'])
-        self.space_feature = torch.nn.functional.normalize(space_features[:, -33:-1], p=2, dim=1).unsqueeze(0)
-        # self.space_feature = space_features.unsqueeze(0)
+        if space_features is not None:
+            self.space_feature = torch.nn.functional.normalize(space_features[:, -33:-1], p=2, dim=1).unsqueeze(0)
+        else:
+            self.space_feature = torch.empty(0).cuda()
+            # self.space_feature = space_features.unsqueeze(0)
     def load_ply(self, path, og_number_points=-1):
         self.og_number_points = og_number_points
         plydata = PlyData.read(path)
@@ -520,8 +528,11 @@ class GaussianModel:
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
+        # 定义需要跳过的网络名称列表
+        ignore_groups = ["brdf_mlp", "Temp_TimeNet", "Temp_Time_DerivativeNet"]
+
         for group in self.optimizer.param_groups:
-            if group["name"] == "brdf_mlp":
+            if group["name"] in ignore_groups:
                 continue
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -537,8 +548,11 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+        # 定义需要跳过的网络名称列表
+        ignore_groups = ["brdf_mlp", "Temp_TimeNet", "Temp_Time_DerivativeNet"]
+
         for group in self.optimizer.param_groups:
-            if group["name"] == "brdf_mlp":
+            if group["name"] in ignore_groups:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -578,8 +592,11 @@ class GaussianModel:
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
+        # 定义需要跳过的网络名称列表
+        ignore_groups = ["brdf_mlp", "Temp_TimeNet", "Temp_Time_DerivativeNet"]
+
         for group in self.optimizer.param_groups:
-            if group["name"] == "brdf_mlp":
+            if group["name"] in ignore_groups:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]

@@ -39,6 +39,7 @@ nvdiffrast/common/cudaraster/impl/RasterImpl.cu
 nvdiffrast/common/cudaraster/impl/RasterImpl.hpp
 nvdiffrast/common/cudaraster/impl/TriangleSetup.inl
 nvdiffrast/common/cudaraster/impl/Util.inl
+nvdiffrast/lib/setgpu.lib
 nvdiffrast/tensorflow/__init__.py
 nvdiffrast/tensorflow/ops.py
 nvdiffrast/tensorflow/plugin_loader.py

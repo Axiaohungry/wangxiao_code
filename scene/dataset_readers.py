@@ -110,7 +110,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height, 
-                              normal_image=None, alpha_mask=None)
+                              normal_image=None, alpha_mask=None, time=0.0)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -186,7 +186,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           maxtime=0,          # 补丁：静态场景时间设为0
+                           spacefeatures=None  # 补丁：静态场景不需要空间特征
+                            )
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
@@ -297,7 +300,9 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           maxtime=None)
+                           maxtime=None,
+                           spacefeatures=None
+                           )
     return scene_info
 
 def transform_vertices_function(vertices, c=1):
@@ -560,7 +565,9 @@ def readNerfSyntheticMeshInfo(
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           maxtime = max_time)
+                           maxtime = max_time,
+                           spacefeatures=None
+                           )
     return scene_info
 
 sceneLoadTypeCallbacks = {

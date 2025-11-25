@@ -27,7 +27,10 @@ setup(
             "spatial.cu", 
             "simple_knn.cu",
             "ext.cpp"],
-            extra_compile_args={"nvcc": [], "cxx": cxx_compiler_flags})
+            extra_compile_args={
+                "nvcc": ["-allow-unsupported-compiler"],  # <--- 这里加上了关键的 flag
+                "cxx": cxx_compiler_flags
+            })
         ],
     cmdclass={
         'build_ext': BuildExtension

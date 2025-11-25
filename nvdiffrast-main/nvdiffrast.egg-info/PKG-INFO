@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: nvdiffrast
 Version: 0.3.1
 Summary: nvdiffrast - modular primitives for high-performance differentiable rendering
@@ -11,6 +11,16 @@ Requires-Python: >=3.6
 Description-Content-Type: text/markdown
 License-File: LICENSE.txt
 Requires-Dist: numpy
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
 
 ## Nvdiffrast &ndash; Modular Primitives for High-Performance Differentiable Rendering
 
