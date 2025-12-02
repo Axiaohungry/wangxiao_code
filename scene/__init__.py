@@ -93,14 +93,30 @@ class Scene:
                                 "brdf_mlp.hdr")
                 self.gaussians.brdf_mlp = load_env(fn, scale=1.0)
                 print(f"Load envmap from: {fn}")
-            if self.gaussians.feature_time:
-                self.gaussians.load_net(os.path.join(self.model_path,
-                                                           "fature_time_net",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "fature_time_net.pth"),
-                                                           scene_info.spacefeatures)
-        else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.spacefeatures, self.cameras_extent)
+                # 1. 先判断是否需要使用时间特征
+                if self.gaussians.feature_time:
+                    # 构建网络权重的完整路径
+                    net_path = os.path.join(self.model_path,
+                                            "fature_time_net",
+                                            "iteration_" + str(self.loaded_iter),
+                                            "fature_time_net.pth")
+
+                    # 2. 检查文件是否存在
+                    if os.path.exists(net_path):
+                        print(f"Loading feature time net from {net_path}")
+                        self.gaussians.load_net(net_path, scene_info.spacefeatures)
+                    else:
+                        # 3. 如果文件不存在（比如跑的是纯静态3DGS），打印警告但不报错，继续向下走
+                        print(f"[Warning] Feature time net config is TRUE, but file not found at {net_path}.")
+                        print("[Warning] Skipping network load. Assuming static model for visualization.")
+                        # 这里可以选择是否要把 feature_time 强制置为 False，防止后续调用出错
+                        # self.gaussians.feature_time = False
+
+                else:
+                    # 4. 常规静态初始化（针对没有任何 checkpoint 的情况，或者显式关闭 feature_time）
+                    print("Initializing from Point Cloud (Static Mode)...")
+                    self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.spacefeatures,
+                                                   self.cameras_extent)
         # if gaussians.feature_time:
         #     gaussians.space_feature = scene_info.spacefeatures.cuda()
             
