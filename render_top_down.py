@@ -1,4 +1,4 @@
-# D:\PycharmProjects\wangxiao_code\render_custom_view_rotated.py
+# D:\PycharmProjects\wangxiao_code\render_top_down.py
 import os
 import copy
 import cv2
