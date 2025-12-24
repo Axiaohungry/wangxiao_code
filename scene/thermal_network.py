@@ -5,10 +5,15 @@ import torch.nn.functional as F
 
 
 class ThermalAttrNet(nn.Module):
-    def __init__(self, input_ch=3, W=16, D=3):  # <--- 必须是 16 !!!
+    def __init__(self, input_ch=8, W=16, D=3):
         """
-        极速版温度网络 (专门优化 6GB 显存 + 440万点云)
-        W: 16 (从 64 降到 16，显存占用降低 75%)
+        热场网络 v1 (Physics Informed)
+        input_ch: 8
+           - 3 (XYZ)
+           - 3 (Normal X,Y,Z)
+           - 1 (Height)
+           - 1 (Slope)
+        W: 16 (保持轻量，防止显存爆炸)
         """
         super().__init__()
         self.layers = nn.ModuleList()
@@ -23,6 +28,7 @@ class ThermalAttrNet(nn.Module):
         self.out = nn.Linear(W, 1)
 
     def forward(self, x):
+        # x: [N, 8]
         h = x
         for i, layer in enumerate(self.layers):
             h = layer(h)
