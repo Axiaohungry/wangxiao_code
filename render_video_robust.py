@@ -22,6 +22,21 @@ from scene.thermal_network import ThermalAttrNet
 
 
 # ==============================================================================
+# Verified Baseline Defaults (IMPORTANT)
+# ------------------------------------------------------------------------------
+# 该组参数已验证视角与模型正确，为当前渲染基准
+# Verified baseline: 2025-12-28 / robust_new
+#
+# expected_up 含义（大白话）：期望的“上方向”单位向量，用来校正相机/坐标系朝向，
+# 避免画面上下颠倒或从地下往上看。
+# ==============================================================================
+DEFAULT_PRIORS_PATH = r"output\debug_run\priors.pt"
+DEFAULT_THERMAL_CKPT = r"output\thermal_robust_new\thermal_net_robust.pth"
+DEFAULT_OUTPUT_VIDEO = r"output\thermal_robust_new\video_robust_new_expectedup.mp4"
+DEFAULT_EXPECTED_UP = "0.04849088,-0.74267894,-0.6678897"
+
+
+# ==============================================================================
 # MiniCam (same convention as project; fixed 3x3 intrinsic)
 # ==============================================================================
 class MiniCam:
@@ -100,10 +115,21 @@ def get_look_at(cam_pos, target, up):
 
 
 def parse_vec3(s: str) -> torch.Tensor:
-    parts = [p.strip() for p in s.split(",")]
+    """
+    Parse "x,y,z" -> normalized torch float32 vec3 (cuda).
+    Raises a clear error if the format is wrong.
+    """
+    raw = s.strip()
+    parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
     if len(parts) != 3:
-        raise ValueError(f"expected vec3 like 'x,y,z', got: {s}")
-    v = torch.tensor([float(parts[0]), float(parts[1]), float(parts[2])], dtype=torch.float32, device="cuda")
+        raise ValueError(f'--expected_up expects format "x,y,z" (3 floats), got: {s!r}')
+
+    try:
+        vals = [float(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError as e:
+        raise ValueError(f'--expected_up must be 3 floats like "0.1,0.2,0.3", got: {s!r}') from e
+
+    v = torch.tensor(vals, dtype=torch.float32, device="cuda")
     v = v / (torch.norm(v) + 1e-8)
     return v
 
@@ -141,9 +167,14 @@ def force_apply_texture_no_grad(gaussians: GaussianModel, rgb01: torch.Tensor):
 def main():
     ap = ArgumentParser()
     ap.add_argument("--model_path", "-m", default="output/debug_run")
-    ap.add_argument("--priors_path", required=True)
-    ap.add_argument("--thermal_ckpt", required=True)
-    ap.add_argument("--output_video", default="output/thermal_robust/video_robust.mp4")
+
+    # -------------------------------------------------------------------------
+    # Defaults = verified baseline (2025-12-28 / robust_new)
+    # NOTE: CLI 传参会覆盖这里的默认值（CLI 优先）
+    # -------------------------------------------------------------------------
+    ap.add_argument("--priors_path", default=DEFAULT_PRIORS_PATH)
+    ap.add_argument("--thermal_ckpt", default=DEFAULT_THERMAL_CKPT)
+    ap.add_argument("--output_video", default=DEFAULT_OUTPUT_VIDEO)
 
     ap.add_argument("--render_res", type=int, default=1024)
     ap.add_argument("--n_frames", type=int, default=120)
@@ -154,8 +185,12 @@ def main():
     ap.add_argument("--orbit_mul", type=float, default=1.5)
     ap.add_argument("--start_angle_deg", type=float, default=0.0)
 
-    # Optional: expected_up from bake_priors_physics.py (will be auto-aligned to -pca_normal)
-    ap.add_argument("--expected_up", default="", help='optional vec3 "x,y,z" from bake_priors_physics')
+    # expected_up: verified baseline default, can be overridden by CLI
+    ap.add_argument(
+        "--expected_up",
+        default=DEFAULT_EXPECTED_UP,
+        help='expected "up" direction vec3 as "x,y,z" (used to keep view upright / consistent)',
+    )
 
     # Chunking to protect 6GB VRAM
     ap.add_argument("--chunk", type=int, default=300000)
@@ -175,10 +210,13 @@ def main():
     if not os.path.exists(args.thermal_ckpt):
         raise FileNotFoundError(args.thermal_ckpt)
 
-    os.makedirs(os.path.dirname(args.output_video), exist_ok=True)
+    # Create output dir if needed
+    out_dir = os.path.dirname(args.output_video)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     # 1) Load Gaussians
-    print("Loading Geometry...")
+    print("Loading Geometry.")
     gaussians = GaussianModel(sh_degree=0, brdf_dim=-1, brdf_mode="pbbr", brdf_envmap_res=0, feature_time=False)
     gaussians.load_ply(ply_path)
 
@@ -252,7 +290,7 @@ def main():
     xyz_norm = (xyz - center) / (max_span + 1e-6)
 
     # 7) Predict colors in chunks, then FORCE APPLY into gaussians SH
-    print("Pre-calculating robust thermal colors (chunked) + force_apply ...")
+    print("Pre-calculating robust thermal colors (chunked) + force_apply .")
     N = xyz.shape[0]
     C0 = 0.28209479177387814
 
@@ -287,7 +325,7 @@ def main():
     bg = torch.tensor([0.0, 0.0, 0.0], device=device)
 
     frames = []
-    print("Rendering robust orbit...")
+    print("Rendering robust orbit.")
     start_angle = math.radians(args.start_angle_deg)
 
     for i in tqdm(range(args.n_frames)):
@@ -322,6 +360,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# render_video_robust.py：对任意 robust ckpt 渲染环绕视频（可指定 --expected_up，也可自动用 PCA+相机纠正得到 real_up）
 
 
 # render_video_robust.py：对任意 robust ckpt 渲染环绕视频（可指定 --expected_up，也可自动用 PCA+相机纠正得到 real_up）
