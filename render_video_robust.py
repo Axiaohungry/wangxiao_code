@@ -1,4 +1,4 @@
-# render_video_robust.py
+# D:\PycharmProjects\wangxiao_code\render_video_robust.py
 import os
 import sys
 import json
@@ -9,7 +9,9 @@ import numpy as np
 from tqdm import tqdm
 from argparse import ArgumentParser
 
+# -----------------------------------------------------------------------------
 # Ensure project import works no matter where you run
+# -----------------------------------------------------------------------------
 ROOT = os.path.abspath(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -20,7 +22,7 @@ from scene.thermal_network import ThermalAttrNet
 
 
 # ==============================================================================
-# MiniCam (same convention as your project)
+# MiniCam (same convention as project; fixed 3x3 intrinsic)
 # ==============================================================================
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
@@ -68,10 +70,7 @@ def get_projection_matrix(znear, zfar, fovX, fovY, device="cuda"):
     return P
 
 
-# ==============================================================================
-# IMPORTANT: This get_look_at is copied from render_video_v1_compare.py
-# (This fixes the "camera under the scene / upside-down view" issue.)
-# ==============================================================================
+# IMPORTANT: exactly the same look-at as render_video_v1_compare.py
 def get_look_at(cam_pos, target, up):
     z_axis = target - cam_pos
     dist = torch.norm(z_axis)
@@ -103,10 +102,40 @@ def get_look_at(cam_pos, target, up):
 def parse_vec3(s: str) -> torch.Tensor:
     parts = [p.strip() for p in s.split(",")]
     if len(parts) != 3:
-        raise ValueError(f"expected vec3 like 'a,b,c', got: {s}")
+        raise ValueError(f"expected vec3 like 'x,y,z', got: {s}")
     v = torch.tensor([float(parts[0]), float(parts[1]), float(parts[2])], dtype=torch.float32, device="cuda")
     v = v / (torch.norm(v) + 1e-8)
     return v
+
+
+# ==============================================================================
+# Force-apply SH DC (no grad needed for video)
+# ==============================================================================
+@torch.no_grad()
+def force_apply_texture_no_grad(gaussians: GaussianModel, rgb01: torch.Tensor):
+    """
+    rgb01: [N, 3] in 0..1
+    Writes to gaussians SH (degree=0), so render() uses the new colors.
+    """
+    C0 = 0.28209479177387814
+    sh_dc = (rgb01 - 0.5) / C0  # [N,3]
+
+    # Write into existing storage if possible (avoid realloc / keep parameters)
+    dc = gaussians._features_dc
+    if isinstance(dc, torch.nn.Parameter):
+        dc.data[:, 0, :].copy_(sh_dc)
+    else:
+        gaussians._features_dc = sh_dc.unsqueeze(1)
+
+    # Clear higher-order SH to avoid mixing old colors
+    if getattr(gaussians, "_features_rest", None) is not None:
+        if gaussians._features_rest.numel() > 0:
+            if isinstance(gaussians._features_rest, torch.nn.Parameter):
+                gaussians._features_rest.data.zero_()
+            else:
+                gaussians._features_rest.zero_()
+
+    gaussians.active_sh_degree = 0
 
 
 def main():
@@ -118,15 +147,22 @@ def main():
 
     ap.add_argument("--render_res", type=int, default=1024)
     ap.add_argument("--n_frames", type=int, default=120)
-    ap.add_argument("--elevation", type=float, default=45.0)      # same default as v1 physics
-    ap.add_argument("--orbit_mul", type=float, default=1.5)       # same default as v1 physics
+    ap.add_argument("--fps", type=int, default=30)
 
-    # View control
-    ap.add_argument("--expected_up", default="", help='optional vec3 "x,y,z" (from your bake_priors_physics)')
-    ap.add_argument("--roll180", action="store_true", help="flip the whole camera view (not the model)")
+    # Orbit params (match your v1 physics defaults)
+    ap.add_argument("--elevation", type=float, default=45.0)
+    ap.add_argument("--orbit_mul", type=float, default=1.5)
+    ap.add_argument("--start_angle_deg", type=float, default=0.0)
+
+    # Optional: expected_up from bake_priors_physics.py (will be auto-aligned to -pca_normal)
+    ap.add_argument("--expected_up", default="", help='optional vec3 "x,y,z" from bake_priors_physics')
+
+    # Chunking to protect 6GB VRAM
+    ap.add_argument("--chunk", type=int, default=300000)
+
     args = ap.parse_args()
-
     device = "cuda"
+
     ply_path = os.path.join(args.model_path, "point_cloud/iteration_7000/point_cloud.ply")
     cameras_json_path = os.path.join(args.model_path, "cameras.json")
 
@@ -142,8 +178,10 @@ def main():
     os.makedirs(os.path.dirname(args.output_video), exist_ok=True)
 
     # 1) Load Gaussians
+    print("Loading Geometry...")
     gaussians = GaussianModel(sh_degree=0, brdf_dim=-1, brdf_mode="pbbr", brdf_envmap_res=0, feature_time=False)
     gaussians.load_ply(ply_path)
+
     gaussians._xyz.requires_grad = False
     for name in ["_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation"]:
         getattr(gaussians, name).requires_grad = False
@@ -151,12 +189,14 @@ def main():
     xyz = gaussians.get_xyz.detach()
     center = xyz.mean(dim=0)
 
-    # 2) Load priors
+    # 2) Load Priors (safe load)
+    print(f"Loading Priors: {args.priors_path}")
     priors = torch.load(args.priors_path, map_location="cuda", weights_only=True)
     if priors.shape[0] != xyz.shape[0] or priors.shape[1] != 5:
         raise ValueError(f"priors shape mismatch: {tuple(priors.shape)} vs xyz {tuple(xyz.shape)}")
 
-    # 3) Load robust net (input=8, uses xyz_norm + priors)
+    # 3) Load Robust Net (input=8, xyz_norm+priors)
+    print(f"Loading Thermal Net: {args.thermal_ckpt}")
     net = ThermalAttrNet(input_ch=8, W=16).cuda()
     net.load_state_dict(torch.load(args.thermal_ckpt, map_location="cuda", weights_only=True))
     net.eval()
@@ -168,24 +208,24 @@ def main():
     fov_y = 2 * math.atan(ref_cam["height"] / (2 * ref_cam["fy"]))
     fov_x = fov_y
 
-    # 5) Build orbit basis (use the SAME robust / v1 style basis logic)
-    # PCA normal (for basis only)
+    # 5) Build orbit basis (STRICTLY match render_video_v1_compare: up_vec = -pca_normal)
     xyz_cpu = xyz.cpu()
     xyz_centered = xyz_cpu - xyz_cpu.mean(dim=0, keepdim=True)
     cov = xyz_centered.T @ xyz_centered / xyz_centered.shape[0]
     _, eigvecs = torch.linalg.eigh(cov)
     pca_normal = eigvecs[:, 0].to(device)
+    up_ref = (-pca_normal) / (torch.norm(pca_normal) + 1e-8)  # this is the "good view" convention
 
-    # up_vec selection:
-    # - If you pass expected_up, we use it
-    # - Else we mimic your v1 physics script: up_vec = -pca_normal
     if args.expected_up.strip():
-        up_vec = parse_vec3(args.expected_up)
+        exp = parse_vec3(args.expected_up)
+        # Align expected_up to the same hemisphere as up_ref to avoid flipped view
+        if torch.dot(exp, up_ref) < 0:
+            exp = -exp
+        up_vec = exp
+        print(f"[Up] using expected_up aligned. dot(expected_up, -pca)= {torch.dot(up_vec, up_ref).item():.4f}")
     else:
-        up_vec = (-pca_normal) / (torch.norm(pca_normal) + 1e-8)
-
-    # Optional: flip entire view (roll 180°) -> this flips the CAMERA, not the model
-    up_for_cam = (-up_vec) if args.roll180 else up_vec
+        up_vec = up_ref
+        print("[Up] using -PCA normal (same as render_video_v1_compare.py)")
 
     temp = torch.tensor([1.0, 0.0, 0.0], device=device)
     if torch.abs(torch.dot(temp, up_vec)) > 0.9:
@@ -203,11 +243,7 @@ def main():
     h_up = orbit_radius * math.sin(elevation_rad)
     r_plane = orbit_radius * math.cos(elevation_rad)
 
-    # Render settings
-    pipe = type("Pipe", (object,), {"compute_cov3D_python": False, "convert_SHs_python": False, "brdf": False, "brdf_mode": "pbbr"})()
-    bg = torch.tensor([0.0, 0.0, 0.0], device=device)
-
-    # 6) Pre-calc colors (robust uses xyz_norm + priors)
+    # 6) Build xyz_norm exactly like train_thermal_robust.py
     min_xyz, _ = torch.min(xyz, dim=0)
     max_xyz, _ = torch.max(xyz, dim=0)
     span_x = (max_xyz[0] - min_xyz[0]).item()
@@ -215,35 +251,69 @@ def main():
     max_span = max(span_x, span_y)
     xyz_norm = (xyz - center) / (max_span + 1e-6)
 
-    print("Pre-calculating robust thermal colors...")
-    with torch.no_grad():
-        full_input = torch.cat([xyz_norm, priors], dim=1).contiguous()
-        t_vals = net(full_input)   # [N,1]
-        colors = t_vals.repeat(1, 3).contiguous()
+    # 7) Predict colors in chunks, then FORCE APPLY into gaussians SH
+    print("Pre-calculating robust thermal colors (chunked) + force_apply ...")
+    N = xyz.shape[0]
+    C0 = 0.28209479177387814
 
-    # 7) Render orbit (IMPORTANT: follow v1 physics convention for being above)
-    # In your v1 physics: offset ... - (up_vec * h_up)
+    # We write directly into gaussians._features_dc to avoid extra huge tensors
+    dc = gaussians._features_dc
+    if isinstance(dc, torch.nn.Parameter):
+        dc_data = dc.data
+    else:
+        # if not parameter, make sure it exists with correct shape
+        gaussians._features_dc = torch.zeros((N, 1, 3), device=device, dtype=torch.float32)
+        dc_data = gaussians._features_dc
+
+    with torch.no_grad():
+        for s in tqdm(range(0, N, args.chunk), desc="infer+apply"):
+            e = min(N, s + args.chunk)
+            inp = torch.cat([xyz_norm[s:e], priors[s:e]], dim=1).contiguous()  # [B,8]
+            t = net(inp)  # [B,1] in 0..1
+            rgb = t.repeat(1, 3)  # [B,3]
+            sh = (rgb - 0.5) / C0  # [B,3]
+            dc_data[s:e, 0, :].copy_(sh)
+
+        # clear rest & set degree
+        if getattr(gaussians, "_features_rest", None) is not None and gaussians._features_rest.numel() > 0:
+            if isinstance(gaussians._features_rest, torch.nn.Parameter):
+                gaussians._features_rest.data.zero_()
+            else:
+                gaussians._features_rest.zero_()
+        gaussians.active_sh_degree = 0
+
+    # 8) Render orbit WITHOUT override_color (colors already written)
+    pipe = type("Pipe", (object,), {"compute_cov3D_python": False, "convert_SHs_python": False, "brdf": False, "brdf_mode": "pbbr"})()
+    bg = torch.tensor([0.0, 0.0, 0.0], device=device)
+
     frames = []
     print("Rendering robust orbit...")
+    start_angle = math.radians(args.start_angle_deg)
+
     for i in tqdm(range(args.n_frames)):
-        angle = 2 * math.pi * (i / args.n_frames)
-        offset = (right_vec * math.cos(angle) * r_plane) + (fwd_vec * math.sin(angle) * r_plane) - (up_vec * h_up)
+        angle = start_angle + 2 * math.pi * (i / args.n_frames)
+
+        # Exactly the same sign convention as render_video_v1_compare.py
+        # (You already verified this view is correct.)
+        offset = (right_vec * math.cos(angle) * r_plane) + \
+                 (fwd_vec * math.sin(angle) * r_plane) - \
+                 (up_vec * h_up)
 
         cam_pos = center + offset
-        w2v = get_look_at(cam_pos, center, up_for_cam)  # roll180 affects up_for_cam
+        w2v = get_look_at(cam_pos, center, up_vec)
         proj = get_projection_matrix(0.1, 1000.0, fov_x, fov_y, device=device).transpose(0, 1)
         full_proj = w2v @ proj
-
         cam = MiniCam(args.render_res, args.render_res, fov_y, fov_x, 0.1, 1000.0, w2v, full_proj)
-        out = render(cam, gaussians, pipe, bg, override_color=colors)["render"]  # [3,H,W]
 
-        img = out.detach().permute(1, 2, 0).cpu().numpy()
+        out = render(cam, gaussians, pipe, bg)["render"]  # [3,H,W]
+        pred = out[0, :, :]  # grayscale since RGB identical
+        img = pred.detach().cpu().numpy()
         img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
         frames.append(cv2.applyColorMap(img, cv2.COLORMAP_JET))
 
     print(f"Saving to: {args.output_video}")
     h, w, _ = frames[0].shape
-    out_vid = cv2.VideoWriter(args.output_video, cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h))
+    out_vid = cv2.VideoWriter(args.output_video, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h))
     for f in frames:
         out_vid.write(f)
     out_vid.release()
