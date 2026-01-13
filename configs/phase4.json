@@ -1,0 +1,306 @@
+{
+  "version": 1,
+  "paths": {
+    "project_root": "D:\\PycharmProjects\\wangxiao_code",
+    "debug_root": "output\\debug_run",
+    "runs_root": "output\\runs"
+  },
+  "run": {
+    "run_tag": "2026-01-06_phase4to6_v2",
+    "seed": 42,
+    "device": "cuda",
+    "log_tee": true,
+    "fail_fast": true,
+    "skip_done": true
+  },
+  "inputs": {
+    "ply": "output\\debug_run\\point_cloud\\iteration_7000\\point_cloud.ply",
+    "cameras_json": "output\\debug_run\\cameras.json",
+    "topdown_rgb": "output\\debug_run\\topdown_final.png",
+    "semantic_label_mask": "output\\debug_run\\semantic_label_mask.png",
+    "lst_gt": "output\\debug_run\\lst_gt.png",
+    "priors_v1": "output\\debug_run\\priors.pt",
+    "ground_points_csv": "data\\ground_points_60.csv"
+  },
+  "pipeline": [
+    "check",
+    "dsm",
+    "hillshade",
+    "semantic",
+    "fuse",
+    "train_v2",
+    "ablate_shadow_only",
+    "ablate_sem_only",
+    "ablate_shuffled",
+    "eval",
+    "calibrate"
+  ],
+  "steps": {
+    "check": {
+      "enabled": true,
+      "type": "python",
+      "script": "tools\\check_manifest.py",
+      "args": {
+        "project_root": "${paths.project_root}",
+        "debug_root": "${paths.debug_root}",
+        "run_dir": "${run.run_dir}"
+      },
+      "expects": {
+        "files": [
+          "${run.run_dir}\\check_report.txt",
+          "${run.run_dir}\\manifest_snapshot.txt"
+        ],
+        "contains_text": [
+          {
+            "path": "${run.run_dir}\\check_report.txt",
+            "must_contain": "OVERALL: PASS"
+          }
+        ]
+      }
+    },
+    "dsm": {
+      "enabled": true,
+      "type": "python",
+      "script": "tools\\render_dsm_topdown.py",
+      "args": {
+        "ply": "${inputs.ply}",
+        "cameras": "${inputs.cameras_json}",
+        "resolution": 2048,
+        "downscale": 1,
+        "zoom": 5.4,
+        "shift_x": 0.0,
+        "shift_y": -1.2,
+        "angle": -31.0,
+        "multiplier": 0.85,
+        "out_npy": "${run.artifacts_dir}\\dsm_float.npy",
+        "out_png": "${run.artifacts_dir}\\dsm_vis.png",
+        "out_rgb_repro": "${run.artifacts_dir}\\topdown_repro.png"
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\dsm_float.npy",
+          "${run.artifacts_dir}\\topdown_repro.png"
+        ]
+      }
+    },
+    "hillshade": {
+      "enabled": true,
+      "type": "python",
+      "script": "tools\\bake_hillshade.py",
+      "args": {
+        "dsm_npy": "${run.artifacts_dir}\\dsm_float.npy",
+        "mode": "continuous",
+        "sun_azimuth_deg": 135,
+        "sun_elevation_deg": 35,
+        "binary_threshold": 0.35,
+        "z_scale": 1.0,
+        "blur_sigma": 0.8,
+        "invert_z": 0,
+        "png_stretch": "p01p99",
+        "out_hillshade_npy": "${run.artifacts_dir}\\hillshade.npy",
+        "out_hillshade_png": "${run.artifacts_dir}\\hillshade.png",
+        "out_shadow_npy": "${run.artifacts_dir}\\shadow_map.npy",
+        "out_shadow_png": "${run.artifacts_dir}\\shadow_map.png"
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\shadow_map.npy",
+          "${run.artifacts_dir}\\shadow_map.png"
+        ]
+      }
+    },
+    "semantic": {
+      "enabled": true,
+      "type": "python",
+      "script": "tools\\segment_semantic.py",
+      "args": {
+        "rgb": "${inputs.topdown_rgb}",
+        "out_png": "${run.artifacts_dir}\\semantic_map.png",
+        "out_npy": "${run.artifacts_dir}\\semantic_map.npy",
+        "method": "segformer",
+        "segformer_ckpt": "weights\\segformer_b0_local",
+        "tile": 512,
+        "device": "${run.device}",
+        "fallback_enable": 1
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\semantic_map.png"
+        ]
+      }
+    },
+    "semantic_sup": {
+  "enabled": true,
+  "type": "python",
+  "script": "tools\\segment_semantic_supervised.py",
+  "args": {
+    "rgb": "${inputs.topdown_rgb}",
+    "label_mask": "${inputs.semantic_label_mask}",
+    "dsm_npy": "${run.artifacts_dir}\\dsm_float.npy",
+    "hillshade_npy": "${run.artifacts_dir}\\hillshade.npy",
+    "out_png": "${run.artifacts_dir}\\semantic_map.png",
+    "out_npy": "${run.artifacts_dir}\\semantic_map.npy",
+    "out_stats_json": "${run.artifacts_dir}\\semantic_stats.json",
+    "tile": 512
+  },
+  "expects": {
+    "nonempty_files": ["${run.artifacts_dir}\\semantic_map.png", "${run.artifacts_dir}\\semantic_stats.json"]
+  }
+},
+
+    "fuse": {
+      "enabled": false,
+      "type": "python",
+      "script": "tools\\fuse_priors_v2.py",
+      "args": {
+        "ply": "${inputs.ply}",
+        "cameras": "${inputs.cameras_json}",
+        "priors_v1": "${inputs.priors_v1}",
+        "shadow_npy": "${run.artifacts_dir}\\shadow_map.npy",
+        "semantic_png": "${run.artifacts_dir}\\semantic_map.png",
+        "semantic_id_map_json": "{\"veg\":0,\"bldg\":1,\"road\":2}",
+        "shadow_mode": "continuous",
+        "out_priors_v2": "${run.artifacts_dir}\\priors_v2.pt",
+        "out_vis_png": "${run.artifacts_dir}\\priors_v2_topdown_vis.png"
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\priors_v2.pt"
+        ]
+      }
+    },
+    "cast_shadow": {
+  "enabled": true,
+  "script": "tools/bake_cast_shadow.py",
+  "cwd": "${paths.project_root}",
+  "args": {
+    "dsm_npy": "${run.artifacts_dir}\\dsm_float.npy",
+    "hillshade_npy": "${run.artifacts_dir}\\hillshade.npy",
+
+    "out_visibility_npy": "${run.artifacts_dir}\\cast_visibility.npy",
+    "out_visibility_png": "${run.artifacts_dir}\\cast_visibility.png",
+
+    "out_effective_shadow_npy": "${run.artifacts_dir}\\shadow_effective.npy",
+    "out_effective_shadow_png": "${run.artifacts_dir}\\shadow_effective.png",
+
+    "out_stats_json": "${run.artifacts_dir}\\cast_shadow_stats.json",
+
+    "direction": "right_to_left",
+    "sun_elev_deg": 55.0,
+    "normalize": "p01p99",
+    "height_scale": 1.0,
+    "soft": true,
+    "soft_k": 20.0,
+    "png_stretch": "p01p99"
+  },
+  "expects": {
+    "nonempty_files": [
+      "${run.artifacts_dir}\\cast_visibility.npy",
+      "${run.artifacts_dir}\\cast_visibility.png",
+      "${run.artifacts_dir}\\shadow_effective.npy",
+      "${run.artifacts_dir}\\shadow_effective.png",
+      "${run.artifacts_dir}\\cast_shadow_stats.json"
+    ]
+  }
+},
+    "train_v2": {
+      "enabled": false,
+      "type": "python",
+      "script": "train_thermal_robust.py",
+      "args": {
+        "ply": "${inputs.ply}",
+        "cameras_json": "${inputs.cameras_json}",
+        "lst_gt": "${inputs.lst_gt}",
+        "priors": "${run.artifacts_dir}\\priors_v2.pt",
+        "out_dir": "${run.ckpt_dir}",
+        "downscale": 2,
+        "max_steps": 12000,
+        "lr": 0.001,
+        "seed": "${run.seed}"
+      },
+      "expects": {
+        "files_glob": [
+          "${run.ckpt_dir}\\*.pth"
+        ]
+      }
+    },
+    "ablate_shadow_only": {
+      "enabled": false,
+      "type": "python",
+      "script": "tools\\make_ablation_priors.py",
+      "args": {
+        "mode": "shadow_only",
+        "in_priors_v2": "${run.artifacts_dir}\\priors_v2.pt",
+        "out_priors": "${run.artifacts_dir}\\priors_v2_shadow_only.pt"
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\priors_v2_shadow_only.pt"
+        ]
+      }
+    },
+    "ablate_sem_only": {
+      "enabled": false,
+      "type": "python",
+      "script": "tools\\make_ablation_priors.py",
+      "args": {
+        "mode": "sem_only",
+        "in_priors_v2": "${run.artifacts_dir}\\priors_v2.pt",
+        "out_priors": "${run.artifacts_dir}\\priors_v2_sem_only.pt"
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\priors_v2_sem_only.pt"
+        ]
+      }
+    },
+    "ablate_shuffled": {
+      "enabled": false,
+      "type": "python",
+      "script": "tools\\shuffle_priors.py",
+      "args": {
+        "in_priors": "${run.artifacts_dir}\\priors_v2.pt",
+        "out_priors": "${run.artifacts_dir}\\priors_v2_shuffled.pt"
+      },
+      "expects": {
+        "nonempty_files": [
+          "${run.artifacts_dir}\\priors_v2_shuffled.pt"
+        ]
+      }
+    },
+    "eval": {
+      "enabled": false,
+      "type": "python",
+      "script": "compare_robust_abc.py",
+      "args": {
+        "ply": "${inputs.ply}",
+        "cameras_json": "${inputs.cameras_json}",
+        "lst_gt": "${inputs.lst_gt}",
+        "out_dir": "${run.renders_dir}"
+      },
+      "expects": {
+        "files_glob": [
+          "${run.renders_dir}\\*.png"
+        ]
+      }
+    },
+    "calibrate": {
+      "enabled": false,
+      "type": "python",
+      "script": "tools\\calibrate_temperature.py",
+      "args": {
+        "points_csv": "${inputs.ground_points_csv}",
+        "ckpt": "${run.ckpt_dir}\\thermal_net_v2.pth",
+        "out_json": "${run.metrics_dir}\\calibration_fit.json",
+        "out_csv": "${run.metrics_dir}\\mae_rmse.csv",
+        "out_video": "${run.renders_dir}\\final_orbit_with_celsius.mp4"
+      },
+      "expects": {
+        "files": [
+          "${run.metrics_dir}\\calibration_fit.json",
+          "${run.metrics_dir}\\mae_rmse.csv"
+        ]
+      }
+    }
+  }
+}

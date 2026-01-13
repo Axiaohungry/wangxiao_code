@@ -8,10 +8,65 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from argparse import ArgumentParser
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render
 from scene.thermal_network import ThermalAttrNet
+
+
+# -------------------------
+# 0) Safe load helpers
+# -------------------------
+def safe_torch_load(path: str, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def load_tensor_from_pt(path: str, map_location="cpu") -> torch.Tensor:
+    obj = safe_torch_load(path, map_location=map_location)
+    if torch.is_tensor(obj):
+        return obj
+    if isinstance(obj, dict):
+        for k in ["priors", "priors_pt", "data", "features", "tensor"]:
+            if k in obj and torch.is_tensor(obj[k]):
+                return obj[k]
+        for v in obj.values():
+            if torch.is_tensor(v):
+                return v
+    raise ValueError(f"Cannot find tensor in {path}")
+
+
+def dump_json(path: str, data: Dict[str, Any]):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_semantic_map_2d(path: str) -> np.ndarray:
+    """
+    Returns HxW uint8 semantic IDs.
+    Supports .npy or image file (png/jpg) single-channel.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(path)
+    if p.suffix.lower() == ".npy":
+        a = np.load(str(p))
+        if a.ndim != 2:
+            raise ValueError(f"semantic_map npy must be HxW, got {a.shape}")
+        return a.astype(np.uint8)
+
+    img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Cannot read semantic_map image: {path}")
+    if img.ndim == 3:
+        img = img[..., 0]
+    if img.ndim != 2:
+        raise ValueError(f"semantic_map image must be single-channel, got {img.shape}")
+    return img.astype(np.uint8)
 
 
 # -------------------------
@@ -85,30 +140,22 @@ def look_at_topdown(cam_pos, target, up):
 
 
 # -------------------------
-# 2) Fix Risk D: 强制覆盖 SH DC（保梯度）
+# 2) Force SH0 (保梯度)
 # -------------------------
 def apply_sh0_from_rgb(gaussians: GaussianModel, rgb01: torch.Tensor, empty_rest: torch.Tensor):
-    """
-    rgb01: [N, 3], range [0,1], requires_grad True
-    通过覆盖 _features_dc/_features_rest 保证渲染一定使用网络预测颜色。
-    """
     C0 = 0.28209479177387814
-    sh_dc = (rgb01 - 0.5) / C0  # [N,3]
-    gaussians._features_dc = sh_dc.unsqueeze(1).contiguous()   # [N,1,3], 保留梯度链
-    gaussians._features_rest = empty_rest                      # [N,0,3], 无条件清空
+    rgb01 = torch.clamp(rgb01, 0.0, 1.0)
+    sh_dc = (rgb01 - 0.5) / C0
+    gaussians._features_dc = sh_dc.unsqueeze(1).contiguous()
+    gaussians._features_rest = empty_rest
     gaussians.active_sh_degree = 0
 
 
 def safe_get_alpha(render_out: dict):
-    """
-    尝试从渲染结果里拿 alpha/accumulation（不同分支命名可能不一样）。
-    返回 shape [H,W] 的 tensor 或 None。
-    """
     for k in ["alpha", "accumulation", "accum", "A"]:
         if k in render_out:
             a = render_out[k]
             if isinstance(a, torch.Tensor):
-                # 常见 shape: [1,H,W] 或 [H,W]
                 if a.dim() == 3:
                     return a[0]
                 if a.dim() == 2:
@@ -116,8 +163,74 @@ def safe_get_alpha(render_out: dict):
     return None
 
 
+def pred_activation(x: torch.Tensor, mode: str) -> torch.Tensor:
+    mode = mode.lower()
+    if mode == "sigmoid":
+        return torch.sigmoid(x)
+    if mode == "tanh01":
+        return 0.5 * (torch.tanh(x) + 1.0)
+    if mode == "clamp01":
+        return torch.clamp(x, 0.0, 1.0)
+    if mode == "none":
+        return x
+    raise ValueError(f"Unknown pred_act: {mode}")
+
+
+def zscore_norm(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mu = x.mean(dim=0, keepdim=True)
+    sd = x.std(dim=0, keepdim=True)
+    sd = torch.clamp(sd, min=eps)
+    return (x - mu) / sd, mu.squeeze(0), sd.squeeze(0)
+
+
+def audit_priors_v3_if_applicable(priors: torch.Tensor, sample_n: int = 200000) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if priors.dim() != 2:
+        return out
+    N, D = priors.shape
+    out["shape"] = [int(N), int(D)]
+    if D == 11:
+        n = min(int(sample_n), int(N))
+        sem = priors[:n, 7:10]
+        s = sem.sum(dim=1)
+        out["semOH_sum_min"] = float(s.min().item())
+        out["semOH_sum_max"] = float(s.max().item())
+        out["semOH_sum_mean"] = float(s.mean().item())
+        out["semOH_unique_values_sample"] = [float(v) for v in torch.unique(sem).cpu().tolist()[:10]]
+
+        sun = priors[:n, 10]
+        out["sun_min"] = float(sun.min().item())
+        out["sun_max"] = float(sun.max().item())
+        out["sun_mean"] = float(sun.mean().item())
+        out["sun_std"] = float(sun.std().item())
+    return out
+
+
+def compute_inview_mask_points_np(xyz_np: np.ndarray, full_T_np: np.ndarray, chunk: int = 400_000) -> np.ndarray:
+    """
+    full_T uses row-vector convention: [x y z 1] @ full_T -> clip
+    Returns boolean mask (N,) whether point is inside NDC [-1,1] in x/y and has valid w.
+    """
+    N = xyz_np.shape[0]
+    mask = np.zeros((N,), dtype=np.bool_)
+    full_T_np = full_T_np.astype(np.float32)
+
+    for s in range(0, N, chunk):
+        e = min(N, s + chunk)
+        pts = xyz_np[s:e].astype(np.float32)
+        ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+        hom = np.concatenate([pts, ones], axis=1)  # Mx4
+        clip = hom @ full_T_np  # Mx4
+        w = clip[:, 3]
+        w = np.where(np.abs(w) < 1e-8, 1e-8, w)
+        ndc = clip[:, 0:3] / w[:, None]
+        in_view = (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0) & (ndc[:, 1] >= -1.0) & (ndc[:, 1] <= 1.0)
+        mask[s:e] = in_view
+    return mask
+
+
 # -------------------------
-# 3) 主流程
+# 3) Main
 # -------------------------
 def main():
     parser = ArgumentParser()
@@ -128,7 +241,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=3000)
     parser.add_argument("--lr", type=float, default=5e-3)
 
-    # cam params（务必与你生成 topdown_final + manual_align 时一致）
+    # cam params
     parser.add_argument("--width", type=int, default=2048)
     parser.add_argument("--height", type=int, default=2048)
     parser.add_argument("--zoom", type=float, default=5.4)
@@ -136,15 +249,33 @@ def main():
     parser.add_argument("--shift_y", type=float, default=-1.2)
     parser.add_argument("--angle", type=float, default=-31.0)
     parser.add_argument("--multiplier", type=float, default=0.85)
-    parser.add_argument("--train_scale", type=float, default=0.5)  # 2048*0.5=1024
+    parser.add_argument("--train_scale", type=float, default=0.5)
 
     # mask options
-    parser.add_argument("--mask_mode", type=str, default="gt+alpha",
-                        help="gt | alpha | gt+alpha | none")
-    parser.add_argument("--gt_eps", type=float, default=1.0/255.0,
-                        help="GT threshold when mask_mode contains gt")
-    parser.add_argument("--alpha_eps", type=float, default=1e-3,
-                        help="Alpha threshold when mask_mode contains alpha")
+    parser.add_argument("--mask_mode", type=str, default="gt+alpha", help="gt | alpha | gt+alpha | none")
+    parser.add_argument("--gt_eps", type=float, default=1.0 / 255.0)
+    parser.add_argument("--alpha_eps", type=float, default=1e-3)
+
+    # stability / normalization
+    parser.add_argument("--pred_act", type=str, default="sigmoid",
+                        choices=["sigmoid", "tanh01", "clamp01", "none"])
+    parser.add_argument("--priors_norm", type=str, default="none", choices=["none", "zscore"])
+    parser.add_argument("--stats_sample", type=int, default=200000)
+
+    # speed: predict only in-view points
+    parser.add_argument("--predict_inview_only", action="store_true",
+                        help="Only run thermal_net forward for points inside current topdown frustum.")
+    parser.add_argument("--inview_chunk", type=int, default=400000)
+
+    # optional semantic weighted loss (pixel-space)
+    parser.add_argument("--semantic_map_path", type=str, default="",
+                        help="Optional semantic_map.(png|npy) aligned with topdown. IDs {0,1,2}.")
+    parser.add_argument("--w_veg", type=float, default=1.0)
+    parser.add_argument("--w_bldg", type=float, default=3.0)
+    parser.add_argument("--w_road", type=float, default=2.0)
+
+    # AMP
+    parser.add_argument("--amp", action="store_true", help="Enable torch.cuda.amp mixed precision.")
 
     # misc
     parser.add_argument("--seed", type=int, default=0)
@@ -163,19 +294,24 @@ def main():
         print(f"[Error] PLY not found: {ply_path}")
         sys.exit(1)
     if not os.path.exists(args.priors_path):
-        print(f"[Error] priors not found: {args.priors_path} (run bake_priors_physics.py first)")
+        print(f"[Error] priors not found: {args.priors_path}")
         sys.exit(1)
     if not os.path.exists(args.gt_path):
         print(f"[Error] GT not found: {args.gt_path}")
         sys.exit(1)
 
-    print("=== Robust Thermal Training (Fix Risk D & C) ===")
+    os.makedirs(args.output_path, exist_ok=True)
+    dump_json(os.path.join(args.output_path, "run_args.json"), vars(args))
+
+    print("=== Robust Thermal Training (v3-ready, frustum-opt, semantic-weight) ===")
+    print(f"[IO] priors_path={args.priors_path}")
+    print(f"[IO] gt_path={args.gt_path}")
+    print(f"[IO] output_path={args.output_path}")
 
     # --- Load Geometry ---
     gaussians = GaussianModel(sh_degree=0, brdf_dim=-1, brdf_mode="pbbr", brdf_envmap_res=0, feature_time=False)
     gaussians.load_ply(ply_path)
 
-    # freeze geometry parameters
     gaussians._xyz.requires_grad = False
     for name in ["_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation"]:
         if hasattr(gaussians, name) and getattr(gaussians, name) is not None:
@@ -190,26 +326,49 @@ def main():
     span_y = (max_xyz[1] - min_xyz[1]).item()
     max_span = max(span_x, span_y)
 
-    # --- Load Priors ---
-    priors = torch.load(args.priors_path).cuda()
+    # --- Load Priors (robust) ---
+    priors = load_tensor_from_pt(args.priors_path, map_location="cpu").float().cuda()
     if priors.dim() != 2 or priors.shape[0] != xyz.shape[0]:
-        print(f"[Error] priors shape mismatch: priors={priors.shape}, xyz={xyz.shape}")
+        print(f"[Error] priors shape mismatch: priors={tuple(priors.shape)}, xyz={tuple(xyz.shape)}")
         sys.exit(1)
-    print(f"Priors loaded: {priors.shape}")
+    print(f"[Priors] loaded shape={tuple(priors.shape)}")
+
+    audit = audit_priors_v3_if_applicable(priors, sample_n=int(args.stats_sample))
+    if audit:
+        dump_json(os.path.join(args.output_path, "priors_audit.json"), audit)
+        if priors.shape[1] == 11:
+            print("[Priors-Audit] v3 detected (dim=11)")
+            print(f"  semOH_sum min/max/mean = {audit.get('semOH_sum_min'):.6f}/{audit.get('semOH_sum_max'):.6f}/{audit.get('semOH_sum_mean'):.6f}")
+            print(f"  sun_facing min/max/mean/std = {audit.get('sun_min'):.6f}/{audit.get('sun_max'):.6f}/{audit.get('sun_mean'):.6f}/{audit.get('sun_std'):.6f}")
+
+            if not (abs(audit.get("semOH_sum_min", 0.0) - 1.0) < 1e-6 and abs(audit.get("semOH_sum_max", 0.0) - 1.0) < 1e-6):
+                print("[FATAL] semOH sum is not 1.0 everywhere (sample). v3 invalid.")
+                sys.exit(1)
+            if not (0.0 <= audit.get("sun_min", -1.0) <= 1.0 and 0.0 <= audit.get("sun_max", 2.0) <= 1.0):
+                print("[FATAL] sun_facing out of [0,1] (sample). v3 invalid.")
+                sys.exit(1)
+
+    if args.priors_norm.lower() == "zscore":
+        priors, mu, sd = zscore_norm(priors)
+        dump_json(os.path.join(args.output_path, "priors_norm_stats.json"), {
+            "mode": "zscore",
+            "mu": [float(v) for v in mu.detach().cpu().tolist()],
+            "sd": [float(v) for v in sd.detach().cpu().tolist()],
+        })
+        print("[Priors] applied zscore normalization")
 
     # --- Camera setup (match render_top_down style) ---
-    with open(cameras_json_path, "r") as f:
+    with open(cameras_json_path, "r", encoding="utf-8") as f:
         cams_data = json.load(f)
     ref_cam = cams_data[0]
-    # 与你旧脚本一致：从 fy/height 推 fovy
     fov_y = 2 * math.atan(ref_cam["height"] / (2 * ref_cam["fy"]))
     fov_x_mod = 2 * math.atan(math.tan(fov_y / 2) * args.multiplier)
 
-    # PCA (CPU) - 与旧脚本保持一致；这里不改你的逻辑
+    # PCA (CPU)
     xyz_cpu = xyz.detach().cpu()
     xyz_centered = xyz_cpu - xyz_cpu.mean(dim=0, keepdim=True)
     cov = xyz_centered.T @ xyz_centered / xyz_centered.shape[0]
-    eigvals, eigvecs = torch.linalg.eigh(cov)
+    _, eigvecs = torch.linalg.eigh(cov)
     normal = eigvecs[:, 0].cuda()
     axis1 = eigvecs[:, 1].cuda()
 
@@ -230,9 +389,11 @@ def main():
         up_axis = new_up / (torch.norm(new_up) + 1e-8)
         right_axis = torch.cross(up_axis, normal)
 
-    # build cam (关键：base_height 用 max_span，匹配 render_top_down)
     train_w = int(args.width * args.train_scale)
     train_h = int(args.height * args.train_scale)
+    if train_w <= 0 or train_h <= 0:
+        print("[FATAL] train_w/train_h invalid.")
+        sys.exit(1)
 
     base_height = (max_span / 2.0) / np.tan(fov_y / 2.0)
     target_height = base_height / args.zoom
@@ -242,17 +403,47 @@ def main():
 
     w2v = look_at_topdown(cam_pos, target_center, up_axis)
     proj = get_projection_matrix(0.01, 100.0, fov_x_mod, fov_y).transpose(0, 1)
-    full_T = w2v @ proj
+    full_T = (w2v @ proj).detach()
     view_cam = MiniCam(train_w, train_h, fov_y, fov_x_mod, 0.01, 100.0, w2v, full_T)
+
+    # --- Optional frustum in-view mask (point-space) ---
+    idx_inview = None
+    if args.predict_inview_only:
+        full_T_np = full_T.detach().cpu().numpy()
+        xyz_np = xyz.detach().cpu().numpy()
+        mask_np = compute_inview_mask_points_np(xyz_np, full_T_np, chunk=int(args.inview_chunk))
+        ratio = float(mask_np.mean()) * 100.0
+        np.save(os.path.join(args.output_path, "point_inview_mask.npy"), mask_np.astype(np.uint8))
+        print(f"[InView] points in frustum = {ratio:.2f}%  (saved point_inview_mask.npy)")
+
+        idx = np.nonzero(mask_np)[0].astype(np.int64)
+        if idx.size < 10000:
+            print("[FATAL] Too few in-view points. Camera params likely mismatch.")
+            sys.exit(1)
+        idx_inview = torch.from_numpy(idx).to(device="cuda", dtype=torch.long)
 
     # --- Load GT ---
     gt_img = cv2.imread(args.gt_path, cv2.IMREAD_GRAYSCALE)
     if gt_img is None:
         raise ValueError("GT not readable.")
     gt_resized = cv2.resize(gt_img, (train_w, train_h), interpolation=cv2.INTER_AREA)
-    gt_tensor = torch.from_numpy(gt_resized).float().cuda() / 255.0  # [H,W]
+    gt_tensor = torch.from_numpy(gt_resized).float().cuda() / 255.0
+    print(f"[GT] resized to {train_w}x{train_h}, mean={gt_tensor.mean().item():.6f}")
 
-    # --- Prepare mask (Fix Risk C) ---
+    # --- Optional semantic weighted loss (pixel-space) ---
+    weight_map = torch.ones_like(gt_tensor)
+    if args.semantic_map_path.strip():
+        sem2d = load_semantic_map_2d(args.semantic_map_path)
+        sem2d_r = cv2.resize(sem2d, (train_w, train_h), interpolation=cv2.INTER_NEAREST)
+        cv2.imwrite(os.path.join(args.output_path, "semantic_map_resized.png"), sem2d_r.astype(np.uint8))
+        w = np.ones_like(sem2d_r, dtype=np.float32)
+        w[sem2d_r == 0] = float(args.w_veg)
+        w[sem2d_r == 1] = float(args.w_bldg)
+        w[sem2d_r == 2] = float(args.w_road)
+        weight_map = torch.from_numpy(w).float().cuda()
+        print(f"[LossWeight] semantic_map enabled. w_veg={args.w_veg} w_bldg={args.w_bldg} w_road={args.w_road}")
+
+    # --- Prepare mask ---
     bg = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
     pipeline_args = type("Pipe", (object,), {
         "compute_cov3D_python": False,
@@ -270,7 +461,6 @@ def main():
 
         if "alpha" in args.mask_mode.lower():
             with torch.no_grad():
-                # 用当前 gaussians 原始颜色渲染一次拿 alpha（颜色不影响 alpha）
                 tmp = render(view_cam, gaussians, pipeline_args, bg)
                 a = safe_get_alpha(tmp)
                 if a is None:
@@ -279,31 +469,38 @@ def main():
                     alpha_mask = (a > args.alpha_eps).float()
                     valid_mask = valid_mask * alpha_mask
 
-    coverage = (valid_mask.sum() / valid_mask.numel()).item() * 100.0
-    print(f"Valid Mask Coverage: {coverage:.2f}%")
+    final_wmask = valid_mask * weight_map
+    coverage = (final_wmask.gt(0).float().mean().item()) * 100.0
+    print(f"[Mask] mode={args.mask_mode}, coverage={coverage:.2f}%")
     if coverage < 1.0:
-        print("[FATAL] Mask coverage too small. Check gt/mask_mode/camera params.")
+        print("[FATAL] Mask coverage too small.")
         sys.exit(1)
 
-    # 保存 mask 方便你肉眼检查
-    os.makedirs(args.output_path, exist_ok=True)
-    mask_vis = (valid_mask.detach().cpu().numpy() * 255).astype(np.uint8)
-    cv2.imwrite(os.path.join(args.output_path, "valid_mask.png"), mask_vis)
+    cv2.imwrite(os.path.join(args.output_path, "valid_mask.png"),
+                (valid_mask.detach().cpu().numpy() * 255).astype(np.uint8))
 
     # --- Network ---
-    thermal_net = ThermalAttrNet(input_ch=8, W=16).cuda()
+    in_ch = 3 + priors.shape[1]
+    print(f"[Phase5] input_ch={in_ch} (XYZ=3 + priors={priors.shape[1]})")
+    thermal_net = ThermalAttrNet(input_ch=in_ch, W=16).cuda()
     thermal_net.train()
+
     optimizer = torch.optim.Adam(thermal_net.parameters(), lr=args.lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp))
 
-    # 输入：XYZ + priors
-    # 建议做一个轻量归一化（只影响优化稳定性，不改变渲染几何）
+    # inputs
     xyz_norm = (gaussians.get_xyz.detach() - center) / (max_span + 1e-6)
-    full_input = torch.cat([xyz_norm, priors], dim=1).contiguous()
 
-    # 空 rest（一次性创建，避免循环反复分配）
+    if idx_inview is not None:
+        full_input = torch.cat([xyz_norm[idx_inview], priors[idx_inview]], dim=1).contiguous()
+        N_in = int(full_input.shape[0])
+        print(f"[Input] using in-view points only: {N_in} / {xyz.shape[0]}")
+    else:
+        full_input = torch.cat([xyz_norm, priors], dim=1).contiguous()
+
     empty_rest = torch.empty((xyz.shape[0], 0, 3), device="cuda", dtype=torch.float32)
 
-    # --- Sanity check: 常数颜色渲染差异，验证强制改色真的生效 ---
+    # --- Sanity: const color ---
     with torch.no_grad():
         c1 = torch.full((xyz.shape[0], 3), 0.1, device="cuda")
         apply_sh0_from_rgb(gaussians, c1, empty_rest)
@@ -315,30 +512,41 @@ def main():
 
     print(f"[Sanity] ConstColor mean: 0.1 -> {r1:.4f}, 0.9 -> {r2:.4f}, diff={abs(r2-r1):.4f}")
     if abs(r2 - r1) < 0.05:
-        print("[FATAL] Force-apply texture seems ineffective. Renderer may not be using _features_dc.")
+        print("[FATAL] Force-apply texture seems ineffective.")
         sys.exit(1)
 
     # --- Train ---
     pbar = tqdm(range(1, args.iterations + 1))
     for it in pbar:
-        thermal_val = thermal_net(full_input)          # [N,1]
-        rgb = thermal_val.expand(-1, 3)                # [N,3]，不额外分配大内存
+        optimizer.zero_grad(set_to_none=True)
 
-        apply_sh0_from_rgb(gaussians, rgb, empty_rest)
+        with torch.cuda.amp.autocast(enabled=bool(args.amp)):
+            thermal_raw = thermal_net(full_input)  # [M,1] or [N,1]
+            thermal_val = pred_activation(thermal_raw, args.pred_act)
+            rgb_in = thermal_val.expand(-1, 3)
 
-        out = render(view_cam, gaussians, pipeline_args, bg)
-        pred = out["render"][0]                        # [H,W]
+            # expand to full N for renderer
+            rgb_full = torch.full((xyz.shape[0], 3), 0.5, device="cuda", dtype=rgb_in.dtype)
+            if idx_inview is not None:
+                rgb_full[idx_inview] = rgb_in
+            else:
+                rgb_full = rgb_in  # already Nx3
 
-        diff = (pred - gt_tensor).abs() * valid_mask
-        loss = diff.sum() / (valid_mask.sum() + 1e-6)
+            apply_sh0_from_rgb(gaussians, rgb_full.float(), empty_rest)
+
+            out = render(view_cam, gaussians, pipeline_args, bg)
+            pred = out["render"][0]  # [H,W]
+
+            diff = (pred - gt_tensor).abs()
+            wmask = final_wmask
+            loss = (diff * wmask).sum() / (wmask.sum() + 1e-6)
 
         if not torch.isfinite(loss):
-            print("[FATAL] Loss is NaN/Inf. Stop.")
+            print("[FATAL] Loss is NaN/Inf.")
             sys.exit(1)
 
-        loss.backward()
+        scaler.scale(loss).backward()
 
-        # 梯度监测（更鲁棒）
         if it % args.grad_every == 0:
             g1 = thermal_net.layers[0].weight.grad
             g2 = thermal_net.out.weight.grad
@@ -352,8 +560,8 @@ def main():
                 sys.exit(1)
             print(f"\n[Grad] it={it} g1={g1m:.3e} g2={g2m:.3e}")
 
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        scaler.step(optimizer)
+        scaler.update()
 
         if it % 10 == 0:
             pbar.set_description(f"Loss: {loss.item():.6f}")
@@ -363,6 +571,7 @@ def main():
             vis_u8 = (vis * 255).astype(np.uint8)
             vis_color = cv2.applyColorMap(vis_u8, cv2.COLORMAP_JET)
             cv2.imwrite(os.path.join(args.output_path, f"train_{it:04d}.png"), vis_color)
+            cv2.imwrite(os.path.join(args.output_path, f"train_{it:04d}_gray.png"), vis_u8)
 
     torch.save(thermal_net.state_dict(), os.path.join(args.output_path, "thermal_net_robust.pth"))
     print("Training Done!")
@@ -370,12 +579,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# 相机几何严格对齐 render_top_down.py（max_span 计算、base_height 公式一致）。
-#
-# GT resize 用 INTER_AREA；mask 支持 gt/alpha/gt+alpha/none。
-#
-# 强制改 SH：无条件清空 _features_rest，并加入常数色差 sanity test。
-#
-# 梯度检查更鲁棒：同时检查第一层和输出层，区分 None 与“很小”。
-#
-# 输入对 xyz 做轻量归一化，提升稳定性（不影响渲染几何）。
