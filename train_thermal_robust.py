@@ -144,10 +144,10 @@ def look_at_topdown(cam_pos, target, up):
 # -------------------------
 def apply_sh0_from_rgb(gaussians: GaussianModel, rgb01: torch.Tensor, empty_rest: torch.Tensor):
     C0 = 0.28209479177387814
-    rgb01 = torch.clamp(rgb01, 0.0, 1.0)
-    sh_dc = (rgb01 - 0.5) / C0
+    rgb01 = torch.clamp(rgb01.float(), 0.0, 1.0)
+    sh_dc = ((rgb01 - 0.5) / C0).float()
     gaussians._features_dc = sh_dc.unsqueeze(1).contiguous()
-    gaussians._features_rest = empty_rest
+    gaussians._features_rest = empty_rest.float()
     gaussians.active_sh_degree = 0
 
 
@@ -534,8 +534,9 @@ def main():
 
             apply_sh0_from_rgb(gaussians, rgb_full.float(), empty_rest)
 
-            out = render(view_cam, gaussians, pipeline_args, bg)
-            pred = out["render"][0]  # [H,W]
+            with torch.cuda.amp.autocast(enabled=False):
+                out = render(view_cam, gaussians, pipeline_args, bg)
+                pred = out["render"][0].float()
 
             diff = (pred - gt_tensor).abs()
             wmask = final_wmask
