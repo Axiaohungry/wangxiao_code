@@ -24,12 +24,6 @@ from scene.thermal_network import ThermalAttrNet
 # ==============================================================================
 # Verified Baseline Defaults (IMPORTANT)
 # ------------------------------------------------------------------------------
-# 该组参数已验证视角与模型正确，为当前渲染基准
-# Verified baseline: 2025-12-28 / robust_new
-#
-# expected_up 含义（大白话）：期望的“上方向”单位向量，用来校正相机/坐标系朝向，
-# 避免画面上下颠倒或从地下往上看。
-# ==============================================================================
 DEFAULT_PRIORS_PATH = r"output\debug_run\priors.pt"
 DEFAULT_THERMAL_CKPT = r"output\thermal_robust_new\thermal_net_robust.pth"
 DEFAULT_OUTPUT_VIDEO = r"output\thermal_robust_new\video_robust_new_expectedup.mp4"
@@ -115,63 +109,104 @@ def get_look_at(cam_pos, target, up):
 
 
 def parse_vec3(s: str) -> torch.Tensor:
-    """
-    Parse "x,y,z" -> normalized torch float32 vec3 (cuda).
-    Raises a clear error if the format is wrong.
-    """
     raw = s.strip()
     parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
     if len(parts) != 3:
         raise ValueError(f'--expected_up expects format "x,y,z" (3 floats), got: {s!r}')
-
     try:
         vals = [float(parts[0]), float(parts[1]), float(parts[2])]
     except ValueError as e:
         raise ValueError(f'--expected_up must be 3 floats like "0.1,0.2,0.3", got: {s!r}') from e
-
     v = torch.tensor(vals, dtype=torch.float32, device="cuda")
     v = v / (torch.norm(v) + 1e-8)
     return v
 
 
 # ==============================================================================
-# Force-apply SH DC (no grad needed for video)
+# v3-compatible helpers (minimal additions)
 # ==============================================================================
-@torch.no_grad()
-def force_apply_texture_no_grad(gaussians: GaussianModel, rgb01: torch.Tensor):
+def safe_torch_load(path: str, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def load_tensor_from_pt(path: str, map_location="cpu") -> torch.Tensor:
+    obj = safe_torch_load(path, map_location=map_location)
+    if torch.is_tensor(obj):
+        return obj
+    if isinstance(obj, dict):
+        for k in ["priors", "priors_pt", "data", "features", "tensor"]:
+            if k in obj and torch.is_tensor(obj[k]):
+                return obj[k]
+        for v in obj.values():
+            if torch.is_tensor(v):
+                return v
+    raise ValueError(f"Cannot find tensor in {path}")
+
+
+def pred_activation(x: torch.Tensor, mode: str) -> torch.Tensor:
+    mode = (mode or "sigmoid").lower()
+    if mode == "sigmoid":
+        return torch.sigmoid(x)
+    if mode == "tanh01":
+        return 0.5 * (torch.tanh(x) + 1.0)
+    if mode == "clamp01":
+        return torch.clamp(x, 0.0, 1.0)
+    if mode == "none":
+        return x
+    raise ValueError(f"Unknown --pred_act: {mode}")
+
+
+def infer_net_dims_from_state_dict(sd: dict) -> tuple:
     """
-    rgb01: [N, 3] in 0..1
-    Writes to gaussians SH (degree=0), so render() uses the new colors.
+    Infer (input_ch, W) from the first linear layer weight.
+    Expect a weight shaped [W, input_ch]. (In your runs W usually = 16.)
     """
-    C0 = 0.28209479177387814
-    sh_dc = (rgb01 - 0.5) / C0  # [N,3]
+    best = None  # (input_ch, W)
+    for k, v in sd.items():
+        if not torch.is_tensor(v):
+            continue
+        if v.ndim == 2 and v.shape[0] >= 4 and v.shape[1] >= 4:
+            # Prefer typical first-layer size: out=W (often 16), in=input_ch (often 8/14/...)
+            # Avoid output layer: [1, W]
+            if v.shape[0] > 1 and v.shape[1] > 1:
+                # Heuristic: first layer often has out dim >= 8
+                if best is None:
+                    best = (int(v.shape[1]), int(v.shape[0]))
+                else:
+                    # Prefer larger input_ch (more informative) when multiple candidates exist
+                    if int(v.shape[1]) > best[0]:
+                        best = (int(v.shape[1]), int(v.shape[0]))
+    if best is None:
+        raise ValueError("Cannot infer input_ch/W from ckpt. Unexpected state_dict format.")
+    return best  # (input_ch, W)
 
-    # Write into existing storage if possible (avoid realloc / keep parameters)
-    dc = gaussians._features_dc
-    if isinstance(dc, torch.nn.Parameter):
-        dc.data[:, 0, :].copy_(sh_dc)
-    else:
-        gaussians._features_dc = sh_dc.unsqueeze(1)
 
-    # Clear higher-order SH to avoid mixing old colors
-    if getattr(gaussians, "_features_rest", None) is not None:
-        if gaussians._features_rest.numel() > 0:
-            if isinstance(gaussians._features_rest, torch.nn.Parameter):
-                gaussians._features_rest.data.zero_()
-            else:
-                gaussians._features_rest.zero_()
-
-    gaussians.active_sh_degree = 0
+def apply_zscore_from_stats(priors: torch.Tensor, stats_json_path: str) -> torch.Tensor:
+    """
+    Apply zscore using saved mu/sd in priors_norm_stats.json (same as train_thermal_robust.py).
+    """
+    stats = json.loads(open(stats_json_path, "r", encoding="utf-8").read())
+    if str(stats.get("mode", "")).lower() != "zscore":
+        print(f"[Warn] priors_norm_stats mode is not zscore: {stats.get('mode')}. Skip.")
+        return priors
+    mu = torch.tensor(stats["mu"], dtype=priors.dtype, device=priors.device).view(1, -1)
+    sd = torch.tensor(stats["sd"], dtype=priors.dtype, device=priors.device).view(1, -1)
+    if mu.numel() != priors.shape[1] or sd.numel() != priors.shape[1]:
+        raise ValueError(f"priors_norm_stats dim mismatch: mu/sd={mu.numel()} priors_dim={priors.shape[1]}")
+    sd = torch.clamp(sd, min=1e-6)
+    return (priors - mu) / sd
 
 
 def main():
     ap = ArgumentParser()
+    ap.add_argument("--no_align_expected_up", action="store_true",
+                    help="Do NOT hemisphere-align expected_up to -PCA normal; use it as-is.")
     ap.add_argument("--model_path", "-m", default="output/debug_run")
 
-    # -------------------------------------------------------------------------
-    # Defaults = verified baseline (2025-12-28 / robust_new)
-    # NOTE: CLI 传参会覆盖这里的默认值（CLI 优先）
-    # -------------------------------------------------------------------------
+    # Defaults = verified baseline (CLI overrides)
     ap.add_argument("--priors_path", default=DEFAULT_PRIORS_PATH)
     ap.add_argument("--thermal_ckpt", default=DEFAULT_THERMAL_CKPT)
     ap.add_argument("--output_video", default=DEFAULT_OUTPUT_VIDEO)
@@ -180,20 +215,24 @@ def main():
     ap.add_argument("--n_frames", type=int, default=120)
     ap.add_argument("--fps", type=int, default=30)
 
-    # Orbit params (match your v1 physics defaults)
+    # Orbit params
     ap.add_argument("--elevation", type=float, default=45.0)
     ap.add_argument("--orbit_mul", type=float, default=1.5)
     ap.add_argument("--start_angle_deg", type=float, default=0.0)
 
-    # expected_up: verified baseline default, can be overridden by CLI
+    # expected_up
     ap.add_argument(
         "--expected_up",
         default=DEFAULT_EXPECTED_UP,
-        help='expected "up" direction vec3 as "x,y,z" (used to keep view upright / consistent)',
+        help='expected "up" direction vec3 as "x,y,z"',
     )
 
-    # Chunking to protect 6GB VRAM
+    # Chunking
     ap.add_argument("--chunk", type=int, default=300000)
+
+    # v3 compat: normalization + activation (match training)
+    ap.add_argument("--priors_norm_stats", default="", help="Path to priors_norm_stats.json (zscore).")
+    ap.add_argument("--pred_act", default="sigmoid", choices=["sigmoid", "tanh01", "clamp01", "none"])
 
     args = ap.parse_args()
     device = "cuda"
@@ -209,8 +248,10 @@ def main():
         raise FileNotFoundError(args.priors_path)
     if not os.path.exists(args.thermal_ckpt):
         raise FileNotFoundError(args.thermal_ckpt)
+    if args.priors_norm_stats.strip() and (not os.path.exists(args.priors_norm_stats)):
+        raise FileNotFoundError(args.priors_norm_stats)
 
-    # Create output dir if needed
+    # Create output dir
     out_dir = os.path.dirname(args.output_video)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -227,16 +268,45 @@ def main():
     xyz = gaussians.get_xyz.detach()
     center = xyz.mean(dim=0)
 
-    # 2) Load Priors (safe load)
+    # 2) Load Priors (v3 compatible)
     print(f"Loading Priors: {args.priors_path}")
-    priors = torch.load(args.priors_path, map_location="cuda", weights_only=True)
-    if priors.shape[0] != xyz.shape[0] or priors.shape[1] != 5:
-        raise ValueError(f"priors shape mismatch: {tuple(priors.shape)} vs xyz {tuple(xyz.shape)}")
+    priors = load_tensor_from_pt(args.priors_path, map_location="cuda").float()
+    if priors.shape[0] != xyz.shape[0]:
+        raise ValueError(f"priors N mismatch: {tuple(priors.shape)} vs xyz {tuple(xyz.shape)}")
 
-    # 3) Load Robust Net (input=8, xyz_norm+priors)
+    if args.priors_norm_stats.strip():
+        print(f"[Priors] applying zscore from: {args.priors_norm_stats}")
+        priors = apply_zscore_from_stats(priors, args.priors_norm_stats)
+
+    pri_dim = int(priors.shape[1])
+    print(f"[Priors] shape={tuple(priors.shape)} (dim={pri_dim})")
+
+    # --- Load Robust Net (infer input_ch/W from ckpt correctly) ---
     print(f"Loading Thermal Net: {args.thermal_ckpt}")
-    net = ThermalAttrNet(input_ch=8, W=16).cuda()
-    net.load_state_dict(torch.load(args.thermal_ckpt, map_location="cuda", weights_only=True))
+
+    # 安全加载（也能避免 FutureWarning）
+    try:
+        sd = torch.load(args.thermal_ckpt, map_location="cpu", weights_only=True)
+    except TypeError:
+        sd = torch.load(args.thermal_ckpt, map_location="cpu")
+
+    # 关键：Linear.weight 形状 = (out_features, in_features)
+    if "layers.0.weight" not in sd:
+        # 兜底：找最像第一层的 weight
+        k0 = [k for k in sd.keys() if k.endswith("layers.0.weight")]
+        if not k0:
+            raise KeyError("Cannot find layers.0.weight in ckpt.")
+        w0 = sd[k0[0]]
+    else:
+        w0 = sd["layers.0.weight"]
+
+    ckpt_W = int(w0.shape[0])  # out_features
+    ckpt_in_ch = int(w0.shape[1])  # in_features
+
+    print(f"[Net] inferred from ckpt: input_ch={ckpt_in_ch}, W={ckpt_W}")
+
+    net = ThermalAttrNet(input_ch=ckpt_in_ch, W=ckpt_W).cuda()
+    net.load_state_dict(sd if isinstance(sd, dict) else sd, strict=True)
     net.eval()
 
     # 4) FOV from cameras.json
@@ -246,21 +316,21 @@ def main():
     fov_y = 2 * math.atan(ref_cam["height"] / (2 * ref_cam["fy"]))
     fov_x = fov_y
 
-    # 5) Build orbit basis (STRICTLY match render_video_v1_compare: up_vec = -pca_normal)
+    # 5) Build orbit basis
     xyz_cpu = xyz.cpu()
     xyz_centered = xyz_cpu - xyz_cpu.mean(dim=0, keepdim=True)
     cov = xyz_centered.T @ xyz_centered / xyz_centered.shape[0]
     _, eigvecs = torch.linalg.eigh(cov)
     pca_normal = eigvecs[:, 0].to(device)
-    up_ref = (-pca_normal) / (torch.norm(pca_normal) + 1e-8)  # this is the "good view" convention
+    up_ref = (-pca_normal) / (torch.norm(pca_normal) + 1e-8)
 
     if args.expected_up.strip():
         exp = parse_vec3(args.expected_up)
-        # Align expected_up to the same hemisphere as up_ref to avoid flipped view
-        if torch.dot(exp, up_ref) < 0:
+        if (not args.no_align_expected_up) and torch.dot(exp, up_ref) < 0:
             exp = -exp
         up_vec = exp
-        print(f"[Up] using expected_up aligned. dot(expected_up, -pca)= {torch.dot(up_vec, up_ref).item():.4f}")
+        print(f"[Up] using expected_up. dot(expected_up, -pca)= {torch.dot(up_vec, up_ref).item():.4f}"
+              + (" (no_align)" if args.no_align_expected_up else ""))
     else:
         up_vec = up_ref
         print("[Up] using -PCA normal (same as render_video_v1_compare.py)")
@@ -290,29 +360,28 @@ def main():
     xyz_norm = (xyz - center) / (max_span + 1e-6)
 
     # 7) Predict colors in chunks, then FORCE APPLY into gaussians SH
-    print("Pre-calculating robust thermal colors (chunked) + force_apply .")
+    print("Pre-calculating thermal colors (chunked) + force_apply.")
     N = xyz.shape[0]
     C0 = 0.28209479177387814
 
-    # We write directly into gaussians._features_dc to avoid extra huge tensors
     dc = gaussians._features_dc
     if isinstance(dc, torch.nn.Parameter):
         dc_data = dc.data
     else:
-        # if not parameter, make sure it exists with correct shape
         gaussians._features_dc = torch.zeros((N, 1, 3), device=device, dtype=torch.float32)
         dc_data = gaussians._features_dc
 
     with torch.no_grad():
         for s in tqdm(range(0, N, args.chunk), desc="infer+apply"):
             e = min(N, s + args.chunk)
-            inp = torch.cat([xyz_norm[s:e], priors[s:e]], dim=1).contiguous()  # [B,8]
-            t = net(inp)  # [B,1] in 0..1
+
+            inp = torch.cat([xyz_norm[s:e], priors[s:e]], dim=1).contiguous()  # [B, 3+pri_dim]
+            t_raw = net(inp)  # [B,1] raw
+            t = pred_activation(t_raw, args.pred_act)  # match training
             rgb = t.repeat(1, 3)  # [B,3]
             sh = (rgb - 0.5) / C0  # [B,3]
             dc_data[s:e, 0, :].copy_(sh)
 
-        # clear rest & set degree
         if getattr(gaussians, "_features_rest", None) is not None and gaussians._features_rest.numel() > 0:
             if isinstance(gaussians._features_rest, torch.nn.Parameter):
                 gaussians._features_rest.data.zero_()
@@ -320,19 +389,17 @@ def main():
                 gaussians._features_rest.zero_()
         gaussians.active_sh_degree = 0
 
-    # 8) Render orbit WITHOUT override_color (colors already written)
+    # 8) Render orbit
     pipe = type("Pipe", (object,), {"compute_cov3D_python": False, "convert_SHs_python": False, "brdf": False, "brdf_mode": "pbbr"})()
     bg = torch.tensor([0.0, 0.0, 0.0], device=device)
 
     frames = []
-    print("Rendering robust orbit.")
+    print("Rendering orbit.")
     start_angle = math.radians(args.start_angle_deg)
 
     for i in tqdm(range(args.n_frames)):
         angle = start_angle + 2 * math.pi * (i / args.n_frames)
 
-        # Exactly the same sign convention as render_video_v1_compare.py
-        # (You already verified this view is correct.)
         offset = (right_vec * math.cos(angle) * r_plane) + \
                  (fwd_vec * math.sin(angle) * r_plane) - \
                  (up_vec * h_up)
@@ -360,9 +427,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# render_video_robust.py：对任意 robust ckpt 渲染环绕视频（可指定 --expected_up，也可自动用 PCA+相机纠正得到 real_up）
-
-
-# render_video_robust.py：对任意 robust ckpt 渲染环绕视频（可指定 --expected_up，也可自动用 PCA+相机纠正得到 real_up）

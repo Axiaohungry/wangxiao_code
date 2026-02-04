@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import math
+import time  # [PATCH] for elapsed time in loss.csv
 import cv2
 import torch
 import numpy as np
@@ -229,6 +230,19 @@ def compute_inview_mask_points_np(xyz_np: np.ndarray, full_T_np: np.ndarray, chu
     return mask
 
 
+# [PATCH] loss csv helpers (minimal, no other behavior change)
+def _loss_csv_init(output_path: str) -> Path:
+    p = Path(output_path) / "loss.csv"
+    if not p.exists():
+        p.write_text("iter,loss,lr,elapsed_sec,mask_coverage_pct,inview_points_pct\n", encoding="utf-8")
+    return p
+
+
+def _loss_csv_append(csv_path: Path, row: str):
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        f.write(row)
+
+
 # -------------------------
 # 3) Main
 # -------------------------
@@ -283,6 +297,10 @@ def main():
     parser.add_argument("--grad_every", type=int, default=100)
     parser.add_argument("--fail_grad_eps", type=float, default=1e-10)
 
+    # [PATCH] loss logging
+    parser.add_argument("--log_every", type=int, default=10,
+                        help="Append one row to output_path/loss.csv every N iters (N>=1).")
+
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -303,10 +321,15 @@ def main():
     os.makedirs(args.output_path, exist_ok=True)
     dump_json(os.path.join(args.output_path, "run_args.json"), vars(args))
 
+    # [PATCH] init loss.csv + timers (no other folder layout changes)
+    loss_csv = _loss_csv_init(args.output_path)
+    t0 = time.time()
+
     print("=== Robust Thermal Training (v3-ready, frustum-opt, semantic-weight) ===")
     print(f"[IO] priors_path={args.priors_path}")
     print(f"[IO] gt_path={args.gt_path}")
     print(f"[IO] output_path={args.output_path}")
+    print(f"[LossCSV] {str(loss_csv)} (log_every={max(1,int(args.log_every))})")
 
     # --- Load Geometry ---
     gaussians = GaussianModel(sh_degree=0, brdf_dim=-1, brdf_mode="pbbr", brdf_envmap_res=0, feature_time=False)
@@ -408,11 +431,13 @@ def main():
 
     # --- Optional frustum in-view mask (point-space) ---
     idx_inview = None
+    inview_points_pct = 100.0  # [PATCH] for loss.csv
     if args.predict_inview_only:
         full_T_np = full_T.detach().cpu().numpy()
         xyz_np = xyz.detach().cpu().numpy()
         mask_np = compute_inview_mask_points_np(xyz_np, full_T_np, chunk=int(args.inview_chunk))
-        ratio = float(mask_np.mean()) * 100.0
+        inview_points_pct = float(mask_np.mean()) * 100.0  # [PATCH]
+        ratio = inview_points_pct
         np.save(os.path.join(args.output_path, "point_inview_mask.npy"), mask_np.astype(np.uint8))
         print(f"[InView] points in frustum = {ratio:.2f}%  (saved point_inview_mask.npy)")
 
@@ -516,6 +541,7 @@ def main():
         sys.exit(1)
 
     # --- Train ---
+    log_every = int(max(1, args.log_every))  # [PATCH]
     pbar = tqdm(range(1, args.iterations + 1))
     for it in pbar:
         optimizer.zero_grad(set_to_none=True)
@@ -566,6 +592,14 @@ def main():
 
         if it % 10 == 0:
             pbar.set_description(f"Loss: {loss.item():.6f}")
+
+        # [PATCH] write loss.csv
+        if (it == 1) or (it % log_every == 0) or (it == args.iterations):
+            lr_now = float(optimizer.param_groups[0]["lr"])
+            elapsed = float(time.time() - t0)
+            lval = float(loss.detach().item())
+            row = f"{it},{lval:.10f},{lr_now:.8g},{elapsed:.3f},{coverage:.4f},{inview_points_pct:.4f}\n"
+            _loss_csv_append(loss_csv, row)
 
         if it % args.save_every == 0 or it == args.iterations:
             vis = pred.detach().clamp(0, 1).cpu().numpy()

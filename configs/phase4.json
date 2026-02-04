@@ -91,7 +91,7 @@
         "dsm_npy": "${run.artifacts_dir}\\dsm_float.npy",
         "mode": "continuous",
         "sun_azimuth_deg": 135,
-        "sun_elevation_deg": 35,
+        "sun_elevation_deg": 75,
         "binary_threshold": 0.35,
         "z_scale": 1.0,
         "blur_sigma": 0.8,
@@ -149,17 +149,16 @@
 },
 
     "fuse": {
-      "enabled": false,
+      "enabled": true,
       "type": "python",
       "script": "tools\\fuse_priors_v2.py",
       "args": {
         "ply": "${inputs.ply}",
+        "ndc_y_mode":"y_up",
         "cameras": "${inputs.cameras_json}",
         "priors_v1": "${inputs.priors_v1}",
         "shadow_npy": "${run.artifacts_dir}\\shadow_map.npy",
-        "semantic_png": "${run.artifacts_dir}\\semantic_map.png",
-        "semantic_id_map_json": "{\"veg\":0,\"bldg\":1,\"road\":2}",
-        "shadow_mode": "continuous",
+        "semantic_map": "${run.artifacts_dir}\\semantic_map.npy",
         "out_priors_v2": "${run.artifacts_dir}\\priors_v2.pt",
         "out_vis_png": "${run.artifacts_dir}\\priors_v2_topdown_vis.png"
       },
@@ -186,7 +185,7 @@
     "out_stats_json": "${run.artifacts_dir}\\cast_shadow_stats.json",
 
     "direction": "right_to_left",
-    "sun_elev_deg": 55.0,
+    "sun_elev_deg": 75.0,
     "normalize": "p01p99",
     "height_scale": 1.0,
     "soft": true,

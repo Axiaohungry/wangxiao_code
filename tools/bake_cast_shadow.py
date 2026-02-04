@@ -291,6 +291,7 @@ def main():
         "visibility_mean": float(vis.mean()),
         "visibility_std": float(vis.std()),
         "visibility_lit_ratio": float((vis > 0.5).mean()),
+        "xy-step":float(args.xy_step),
     }
 
     # Optional: effective shadow = hillshade * visibility

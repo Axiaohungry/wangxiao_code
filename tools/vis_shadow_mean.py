@@ -109,11 +109,9 @@ def project_xy(xyz_np, full_T_np, W, H, ndc_y_mode):
 
     # IMPORTANT: choose one convention and stick to it
     if ndc_y_mode == "y_up":
-        # ndc y is up, image y is down
-        y = (0.5 - ndc[:, 1] * 0.5) * (H - 1)
-    else:
-        # ndc y is already down-like (rare). Keep as is.
         y = (ndc[:, 1] * 0.5 + 0.5) * (H - 1)
+    else:
+        y = (0.5 - ndc[:, 1] * 0.5) * (H - 1)
 
     in_view = (ndc[:, 0] >= -1) & (ndc[:, 0] <= 1) & (ndc[:, 1] >= -1) & (ndc[:, 1] <= 1)
     xi = np.clip(np.round(x).astype(np.int32), 0, W - 1)
