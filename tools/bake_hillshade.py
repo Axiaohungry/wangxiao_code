@@ -103,7 +103,7 @@ def main():
     ap.add_argument("--dsm_npy", required=True, help="path to artifacts/dsm_float.npy (float32 HxW)")
     ap.add_argument("--mode", default="continuous", choices=["continuous", "binary"])
     ap.add_argument("--sun_azimuth_deg", type=float, default=135.0)
-    ap.add_argument("--sun_elevation_deg", type=float, default=35.0)
+    ap.add_argument("--sun_elevation_deg", type=float, default=75.0)
     ap.add_argument("--binary_threshold", type=float, default=0.35)
 
     ap.add_argument("--cell_size", type=float, default=1.0, help="pixel size in XY units (relative)")
